@@ -58,12 +58,12 @@ int main() {
     cJSON *messages = cJSON_CreateArray();
     cJSON *msg = cJSON_CreateObject();
     cJSON_AddStringToObject(msg, "role", "user");
-    cJSON_AddStringToObject(msg, "content", "what is fuck is going on?");
+    cJSON_AddStringToObject(msg, "content", "hello. this is test for my c program. расскажи о коллбеках в c как будто ты демонический разраб с гитхаба. сделай это за 15 слов");
     cJSON_AddItemToArray(messages, msg);
     cJSON_AddItemToObject(root, "messages", messages);
 
     cJSON *reasoning = cJSON_CreateObject();
-    cJSON_AddBoolToObject(reasoning, "enabled", 1);
+    cJSON_AddBoolToObject(reasoning, "enabled", 0);
     cJSON_AddItemToObject(root, "reasoning", reasoning);
 
     json_data = cJSON_Print(root);
