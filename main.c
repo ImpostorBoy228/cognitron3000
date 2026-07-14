@@ -32,7 +32,8 @@ char* readenv(void) {
     if (!buf) { fclose(f); return NULL; }
     size_t n = fread(buf, 1, len, f);
     if (n != (size_t)len) { free(buf); fclose(f); return NULL; }
-    buf[len] = '\0';
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+    buf[n] = '\0';
     fclose(f);
     return buf;
 }
@@ -112,6 +113,7 @@ int main() {
                     }
                 } else {
                     fuck("no choices", stderr);
+                    printf("raw response:\n%s\n", chunk.response);
                 }
             } else {
                 printf("fuck: json parsing:\n%s\n", chunk.response);
