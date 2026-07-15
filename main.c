@@ -21,10 +21,11 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
 
     size_t needed = s->len + total + 1;
     if (needed > s->cap) {
-        s->cap = needed + 1024;
-        char *ptr = realloc(s->buffer, s->cap);
+        size_t newcap = needed + 1024;
+        char *ptr = realloc(s->buffer, newcap);
         if (!ptr) return 0;
         s->buffer = ptr;
+        s->cap = newcap;
     }
     memcpy(s->buffer + s->len, contents, total);
     s->len += total;
@@ -100,7 +101,6 @@ char* readenv(void) {
 
 void fuck(char* reason, FILE* stream) {
     fprintf(stream, "fuck: %s\n", reason);
-    return;
 }
 
 char* nostream(cJSON *root, CURL *curl) {
@@ -108,7 +108,8 @@ char* nostream(cJSON *root, CURL *curl) {
     char *json_data = cJSON_Print(root);
     if (!json_data) return NULL;
 
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data);
+    curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, json_data);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_data));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_memory);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
 
@@ -128,10 +129,14 @@ char* nostream(cJSON *root, CURL *curl) {
     char *result = NULL;
     if (cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
         cJSON *first = cJSON_GetArrayItem(choices, 0);
-        cJSON *message = cJSON_GetObjectItem(first, "message");
-        cJSON *content = cJSON_GetObjectItem(message, "content");
-        if (cJSON_IsString(content)) {
-            result = strdup(content->valuestring);
+        if (first) {
+            cJSON *message = cJSON_GetObjectItem(first, "message");
+            if (message) {
+                cJSON *content = cJSON_GetObjectItem(message, "content");
+                if (cJSON_IsString(content)) {
+                    result = strdup(content->valuestring);
+                }
+            }
         }
     }
     cJSON_Delete(resp_json);
@@ -143,7 +148,7 @@ int main() {
     CURL *curl = NULL;
     CURLcode res;
     struct StreamState chunk = {NULL, 0, 0};
-    cJSON *root = NULL, *resp_json = NULL;
+    cJSON *root = NULL;
     char *json_data = NULL, *token = NULL;
     struct curl_slist *headers = NULL;
 
@@ -183,34 +188,35 @@ int main() {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl = curl_easy_init();
 
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "https://openrouter.ai/api/v1/chat/completions");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data);
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-        // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-
-        res = curl_easy_perform(curl);
-
-        if (res != CURLE_OK) {
-            fprintf(stderr, "curl failed: %s\n", curl_easy_strerror(res));
-            ret = 1;
-        }
-        printf("\n");
-
-        curl_easy_cleanup(curl);
-        free(chunk.buffer);
+    if (!curl) {
+        fprintf(stderr, "fuck: failed to init curl\n");
+        ret = 1;
+        goto naxyi;
     }
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://openrouter.ai/api/v1/chat/completions");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+
+    res = curl_easy_perform(curl);
+
+    if (res != CURLE_OK) {
+        fprintf(stderr, "curl failed: %s\n", curl_easy_strerror(res));
+        ret = 1;
+    }
+    printf("\n");
+
+    curl_easy_cleanup(curl);
+    free(chunk.buffer);
 
     curl_global_cleanup();
 
 naxyi:
     free(token);
     free(json_data);
-    cJSON_Delete(resp_json);
     cJSON_Delete(root);
     curl_slist_free_all(headers);
     return ret;
