@@ -104,84 +104,74 @@ static size_t memwrite(void *contents, size_t size, size_t nmemb, void *userp) {
 }
 
 static char* llmreq(const char *user_text, CURL *curl) {
-    struct memchunk c = {NULL, 0};
+    char *apikey = readenv(".env");
+    if (!apikey) return NULL;
+
+    char *sys = rfile("prompts/system_main.md");
+    if (!sys) { free(apikey); return NULL; }
+
+    json_object *root = json_object_new_object();
+    json_object_object_add(root, "model", json_object_new_string("gpt-oss-120b"));
+    json_object_object_add(root, "max_completion_tokens", json_object_new_int(1024));
+    json_object_object_add(root, "temperature", json_object_new_double(1.0));
+    json_object_object_add(root, "top_p", json_object_new_int(1));
+    json_object_object_add(root, "stream", json_object_new_boolean(0));
+    json_object_object_add(root, "reasoning_effort", json_object_new_string("low"));
+
+    json_object *msgs = json_object_new_array();
+    json_object *sysmsg = json_object_new_object();
+    json_object_object_add(sysmsg, "role", json_object_new_string("system"));
+    json_object_object_add(sysmsg, "content", json_object_new_string(sys));
+    json_object_array_add(msgs, sysmsg);
+    free(sys);
+
+    json_object *usermsg = json_object_new_object();
+    json_object_object_add(usermsg, "role", json_object_new_string("user"));
+    json_object_object_add(usermsg, "content", json_object_new_string(user_text));
+    json_object_array_add(msgs, usermsg);
+
+    json_object_object_add(root, "messages", msgs);
+
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
+    char auth[512];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", apikey);
+    headers = curl_slist_append(headers, auth);
+    free(apikey);
 
-    curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:4096/session");
+    const char *jstr = json_object_to_json_string(root);
+
+    struct memchunk c = {NULL, 0};
+    curl_easy_setopt(curl, CURLOPT_URL, "https://api.cerebras.ai/v1/chat/completions");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "{\"title\":\"agent\"}");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jstr);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, memwrite);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&c);
 
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) { free(c.buf); curl_slist_free_all(headers); return NULL; }
-
-    json_object *sr = json_tokener_parse(c.buf);
-    free(c.buf); c.buf = NULL; c.len = 0;
-    if (!sr) { curl_slist_free_all(headers); return NULL; }
-
-    json_object *sid;
-    const char *session_id = NULL;
-    if (json_object_object_get_ex(sr, "id", &sid))
-        session_id = json_object_get_string(sid);
-    if (!session_id) { json_object_put(sr); curl_slist_free_all(headers); return NULL; }
-
-    char url[512];
-    snprintf(url, sizeof(url), "http://localhost:4096/session/%s/message", session_id);
-    json_object_put(sr);
-
-    char *sys = rfile("prompts/system_main.md");
-    json_object *root = json_object_new_object();
-    if (sys) {
-        json_object_object_add(root, "system", json_object_new_string(sys));
-        free(sys);
-    }
-    json_object *parts = json_object_new_array();
-    json_object *part = json_object_new_object();
-    json_object_object_add(part, "type", json_object_new_string("text"));
-    json_object_object_add(part, "text", json_object_new_string(user_text));
-    json_object_array_add(parts, part);
-    json_object_object_add(root, "parts", parts);
-
-    json_object *model = json_object_new_object();
-    json_object_object_add(model, "providerID", json_object_new_string("opencode"));
-    json_object_object_add(model, "modelID", json_object_new_string("deepseek-v4-flash-free"));
-    json_object_object_add(root, "model", model);
-
-    const char *jstr = json_object_to_json_string(root);
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jstr);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&c);
-
-    res = curl_easy_perform(curl);
     json_object_put(root);
+    curl_slist_free_all(headers);
 
-    if (res != CURLE_OK) { free(c.buf); curl_slist_free_all(headers); return NULL; }
+    if (res != CURLE_OK) { free(c.buf); return NULL; }
 
-    json_object *mr = json_tokener_parse(c.buf);
+    json_object *jr = json_tokener_parse(c.buf);
     free(c.buf);
-    if (!mr) { curl_slist_free_all(headers); return NULL; }
+    if (!jr) return NULL;
 
     char *result = NULL;
-    json_object *pa;
-    if (json_object_object_get_ex(mr, "parts", &pa) && json_object_is_type(pa, json_type_array)) {
-        int n = json_object_array_length(pa);
-        for (int i = 0; i < n; i++) {
-            json_object *p = json_object_array_get_idx(pa, i);
-            json_object *t;
-            if (json_object_object_get_ex(p, "type", &t) && strcmp(json_object_get_string(t), "text") == 0) {
-                json_object *txt;
-                if (json_object_object_get_ex(p, "text", &txt)) {
-                    result = strdup(json_object_get_string(txt));
-                    break;
-                }
+    json_object *choices;
+    if (json_object_object_get_ex(jr, "choices", &choices) && json_object_is_type(choices, json_type_array) && json_object_array_length(choices) > 0) {
+        json_object *first = json_object_array_get_idx(choices, 0);
+        json_object *msg;
+        if (json_object_object_get_ex(first, "message", &msg)) {
+            json_object *content;
+            if (json_object_object_get_ex(msg, "content", &content)) {
+                result = strdup(json_object_get_string(content));
             }
         }
     }
 
-    json_object_put(mr);
-    curl_slist_free_all(headers);
+    json_object_put(jr);
     return result;
 }
 
@@ -249,7 +239,9 @@ int main(void) {
 
             char *reply = llmreq(u->message.text, curl);
             if (reply) {
-                telebot_send_message(bot, u->message.chat->id, reply, NULL, false, false, 0, NULL);
+                telebot_error_e err = telebot_send_message(bot, u->message.chat->id, reply, "HTML", false, false, 0, NULL);
+                if (err != TELEBOT_ERROR_NONE)
+                    telebot_send_message(bot, u->message.chat->id, reply, NULL, false, false, 0, NULL);
                 free(reply);
             } else {
                 telebot_send_message(bot, u->message.chat->id,
