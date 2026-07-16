@@ -10,39 +10,8 @@
 #include "記憶.h"
 #include "nostream.h"
 #include "libs/mimalloc.h"
-
-static char* readenv(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long len = ftell(f);
-    if (len <= 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
-    char *buf = mi_malloc(len + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t n = fread(buf, 1, len, f);
-    if (n != (size_t)len) { mi_free(buf); fclose(f); return NULL; }
-    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
-    buf[n] = '\0';
-    fclose(f);
-    return buf;
-}
-
-static char* rfile(const char* path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long len = ftell(f);
-    if (len <= 0) { fclose(f); return NULL; }
-    fseek(f, 0, SEEK_SET);
-    char *buf = mi_malloc(len + 1);
-    if (!buf) { fclose(f); return NULL; }
-    size_t n = fread(buf, 1, len, f);
-    if (n != (size_t)len) { mi_free(buf); fclose(f); return NULL; }
-    fclose(f);
-    buf[len] = '\0';
-    return buf;
-}
+#include "io/file.h"
+#include "io/logs.h"
 
 struct memchunk {
     char *buf;
@@ -134,6 +103,24 @@ static json_object* toolcall(json_object *msgs, CURL *curl) {
     json_object_object_add(file_write, "function", fw_func);
     json_object_array_add(tools, file_write);
 
+    json_object *send_tg = json_object_new_object();
+    json_object_object_add(send_tg, "type", json_object_new_string("function"));
+    json_object *st_func = json_object_new_object();
+    json_object_object_add(st_func, "name", json_object_new_string("send_telegram"));
+    json_object_object_add(st_func, "description", json_object_new_string("Send a message to the Telegram chat"));
+    json_object *st_params = json_object_new_object();
+    json_object_object_add(st_params, "type", json_object_new_string("object"));
+    json_object *st_props = json_object_new_object();
+    json_object *st_msg_prop = json_object_new_object();
+    json_object_object_add(st_msg_prop, "type", json_object_new_string("string"));
+    json_object_object_add(st_msg_prop, "description", json_object_new_string("Message text to send"));
+    json_object_object_add(st_props, "message", st_msg_prop);
+    json_object_object_add(st_params, "properties", st_props);
+    json_object_object_add(st_params, "required", json_object_new_array_ext(0));
+    json_object_object_add(st_func, "parameters", st_params);
+    json_object_object_add(send_tg, "function", st_func);
+    json_object_array_add(tools, send_tg);
+
     json_object_object_add(root, "tools", tools);
 
     struct curl_slist *headers = NULL;
@@ -196,10 +183,13 @@ static char* exec_cmd(const char *cmd) {
     close(pipefd[0]);
     waitpid(pid, NULL, 0);
     buf[len] = '\0';
+    char logbuf[len];
+    snprintf(logbuf, sizeof(logbuf), "[TOOL: command](%s)\n%s", cmd, buf);
+    wlog(logbuf);
     return buf;
 }
 
-static char* exec_tool(const char *name, const char *args_json) {
+static char* exec_tool(const char *name, const char *args_json, telebot_handler_t bot, int64_t chat_id) {
     json_object *args = json_tokener_parse(args_json);
     if (!args) return mi_strdup("{\"error\": \"failed to parse args\"}");
 
@@ -220,12 +210,20 @@ static char* exec_tool(const char *name, const char *args_json) {
     } else if (strcmp(name, "file_write") == 0) {
         json_object *path, *content;
         if (!json_object_object_get_ex(args, "path", &path) || !json_object_object_get_ex(args, "content", &content)) { json_object_put(args); return mi_strdup("{\"error\": \"missing path or content\"}"); }
-        FILE *f = fopen(json_object_get_string(path), "w");
-        if (!f) { json_object_put(args); return mi_strdup("{\"error\": \"failed to open file for writing\"}"); }
-        fwrite(json_object_get_string(content), 1, strlen(json_object_get_string(content)), f);
-        fclose(f);
+        char *err = wfile(json_object_get_string(path), json_object_get_string(content));
         json_object_put(args);
-        return mi_strdup("{\"status\": \"written\"}");
+        return err ? err : mi_strdup("{\"status\": \"written\"}");
+
+    } else if (strcmp(name, "send_telegram") == 0) {
+        json_object *msg;
+        if (!json_object_object_get_ex(args, "message", &msg)) { json_object_put(args); return mi_strdup("{\"error\": \"missing message\"}"); }
+        const char *text = json_object_get_string(msg);
+        json_object_put(args);
+        telebot_send_message(bot, chat_id, text, NULL, false, false, 0, NULL);
+        char logbuf[1024];
+        snprintf(logbuf, sizeof(logbuf), "[SEND_TG] %s", text);
+        wlog(logbuf);
+        return mi_strdup("{\"status\": \"sent\"}");
 
     } else {
         json_object_put(args);
@@ -235,7 +233,7 @@ static char* exec_tool(const char *name, const char *args_json) {
     }
 }
 
-static char* llmreq(json_object *msgs, CURL *curl) {
+static char* llmreq(json_object *msgs, CURL *curl, telebot_handler_t bot, int64_t chat_id) {
     char *result = NULL;
     int max_turns = 10;
 
@@ -279,10 +277,12 @@ static char* llmreq(json_object *msgs, CURL *curl) {
         json_object_array_add(msgs, assistant_msg);
 
         if (!has_tc) {
-            if (has_content)
-                result = mi_strdup(json_object_get_string(content));
-            else
-                result = mi_strdup("");
+            if (has_content) {
+                const char *text = json_object_get_string(content);
+                if (strcmp(text, "[STOP_LOOP]") == 0) {
+                    result = mi_strdup("[STOP_LOOP]");
+                }
+            }
             json_object_put(jr);
             break;
         }
@@ -297,7 +297,7 @@ static char* llmreq(json_object *msgs, CURL *curl) {
             const char *fname = json_object_get_string(json_object_object_get(func, "name"));
             const char *fargs = json_object_get_string(json_object_object_get(func, "arguments"));
 
-            char *fresult = exec_tool(fname, fargs);
+            char *fresult = exec_tool(fname, fargs, bot, chat_id);
 
             json_object *tool_msg = json_object_new_object();
             json_object_object_add(tool_msg, "role", json_object_new_string("tool"));
@@ -380,9 +380,12 @@ int main(void) {
             if (!u->message.text)
                 continue;
 
-            printf("msg from @%s: %s\n",
+            char logbuf[1024];
+            snprintf(logbuf, sizeof(logbuf), "[RECV] from @%s: %s",
                 u->message.from ? u->message.from->username : "?",
                 u->message.text);
+            wlog(logbuf);
+            printf("%s\n", logbuf);
 
             telebot_send_chat_action(bot, u->message.chat->id, "typing");
 
@@ -391,15 +394,13 @@ int main(void) {
             json_object_object_add(usermsg, "content", json_object_new_string(u->message.text));
             json_object_array_add(msgs, usermsg);
 
-            char *reply = llmreq(msgs, curl);
+            char *reply = llmreq(msgs, curl, bot, u->message.chat->id);
             if (reply) {
-                telebot_error_e err = telebot_send_message(bot, u->message.chat->id, reply, "HTML", false, false, 0, NULL);
-                if (err != TELEBOT_ERROR_NONE)
-                    telebot_send_message(bot, u->message.chat->id, reply, NULL, false, false, 0, NULL);
+                if (strcmp(reply, "[STOP_LOOP]") != 0) {
+                    snprintf(logbuf, sizeof(logbuf), "[RAW] %s", reply);
+                    wlog(logbuf);
+                }
                 mi_free(reply);
-            } else {
-                telebot_send_message(bot, u->message.chat->id,
-                    "fuck: LLM request failed", NULL, false, false, 0, NULL);
             }
 
             offset = u->update_id + 1;

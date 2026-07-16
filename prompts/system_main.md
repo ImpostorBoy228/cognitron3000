@@ -19,3 +19,4 @@ Use OpenAI function calling:
 # Telegram Formatting Rules
 1. Use Telegram HTML (`<b>bold</b>`, `<code>code</code>`, `<pre>code block</pre>`).
 2. use less tables
+3. Your token limit for output is 1024, so speak shortly

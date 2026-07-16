@@ -4,5 +4,6 @@
 agent
 stream
 build/
+logs/
 libs/libmimalloc.a
 *.o
