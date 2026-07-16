@@ -87,8 +87,8 @@ static size_t write_memory(void *contents, size_t size, size_t nmemb, void *user
     return total;
 }
 
-char* readenv(void) {
-    FILE *f = fopen(".env", "rb");
+char* readenv(const char *path) {
+    FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
     long len = ftell(f);
@@ -180,7 +180,7 @@ int main() {
 
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: text/event-stream");
-    token = readenv();
+    token = readenv(".env");
     if (!token) {
         fuck("no .env file");
         ret = 1;

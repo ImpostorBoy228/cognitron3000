@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
 #include <telebot/telebot.h>
@@ -70,6 +71,23 @@ static void msgsmi_free(messages *list) {
     }
     list->head = list->tail = NULL;
     list->count = 0;
+}
+
+static char* readenv(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long len = ftell(f);
+    if (len <= 0) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET);
+    char *buf = mi_malloc(len + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, len, f);
+    if (n != (size_t)len) { mi_free(buf); fclose(f); return NULL; }
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+    buf[n] = '\0';
+    fclose(f);
+    return buf;
 }
 
 static char* rfile(const char* path) {
@@ -207,6 +225,42 @@ static json_object* toolcall(json_object *msgs, CURL *curl) {
     return jr;
 }
 
+static char* exec_cmd(const char *cmd) {
+    int pipefd[2];
+    if (pipe(pipefd) == -1) return mi_strdup("{\"error\": \"pipe failed\"}");
+
+    pid_t pid = fork();
+    if (pid == -1) { close(pipefd[0]); close(pipefd[1]); return mi_strdup("{\"error\": \"fork failed\"}"); }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    size_t cap = 4096, len = 0;
+    char *buf = mi_malloc(cap);
+    if (!buf) { close(pipefd[0]); waitpid(pid, NULL, 0); return mi_strdup("{\"error\": \"alloc failed\"}"); }
+
+    ssize_t n;
+    while ((n = read(pipefd[0], buf + len, cap - len - 1)) > 0) {
+        len += n;
+        if (len >= cap - 1) {
+            cap *= 2;
+            char *tmp = mi_realloc(buf, cap);
+            if (!tmp) { mi_free(buf); close(pipefd[0]); waitpid(pid, NULL, 0); return mi_strdup("{\"error\": \"realloc failed\"}"); }
+            buf = tmp;
+        }
+    }
+    close(pipefd[0]);
+    waitpid(pid, NULL, 0);
+    buf[len] = '\0';
+    return buf;
+}
+
 static char* exec_tool(const char *name, const char *args_json) {
     json_object *args = json_tokener_parse(args_json);
     if (!args) return mi_strdup("{\"error\": \"failed to parse args\"}");
@@ -215,14 +269,8 @@ static char* exec_tool(const char *name, const char *args_json) {
         json_object *cmd;
         if (!json_object_object_get_ex(args, "command", &cmd)) { json_object_put(args); return mi_strdup("{\"error\": \"missing command\"}"); }
         const char *command = json_object_get_string(cmd);
-        FILE *fp = popen(command, "r");
-        if (!fp) { json_object_put(args); return mi_strdup("{\"error\": \"popen failed\"}"); }
-        char buf[4096];
-        size_t len = 0;
-        while (fgets(buf + len, sizeof(buf) - len, fp)) len = strlen(buf);
-        pclose(fp);
         json_object_put(args);
-        return mi_strdup(buf);
+        return exec_cmd(command);
 
     } else if (strcmp(name, "file_read") == 0) {
         json_object *path;
@@ -282,8 +330,9 @@ static char* llmreq(const char *user_text, CURL *curl) {
         json_object *msg;
         if (!json_object_object_get_ex(first, "message", &msg)) { json_object_put(jr); break; }
 
-        json_object *content;
-        json_object *tool_calls;
+        json_object *content = NULL;
+        json_object *tool_calls = NULL;
+        int has_content = json_object_object_get_ex(msg, "content", &content);
 
         int has_tc = json_object_object_get_ex(msg, "tool_calls", &tool_calls)
                      && json_object_is_type(tool_calls, json_type_array)
@@ -292,7 +341,7 @@ static char* llmreq(const char *user_text, CURL *curl) {
         json_object *assistant_msg = json_object_new_object();
         json_object_object_add(assistant_msg, "role", json_object_new_string("assistant"));
         json_object_object_add(assistant_msg, "content", json_object_new_string(
-            json_object_object_get_ex(msg, "content", &content) ? json_object_get_string(content) : ""));
+            has_content ? json_object_get_string(content) : ""));
 
         if (has_tc) {
             json_object *tc_copy = json_object_new_array();
@@ -307,7 +356,10 @@ static char* llmreq(const char *user_text, CURL *curl) {
         json_object_array_add(msgs, assistant_msg);
 
         if (!has_tc) {
-            result = mi_strdup(json_object_get_string(content));
+            if (has_content)
+                result = mi_strdup(json_object_get_string(content));
+            else
+                result = mi_strdup("");
             json_object_put(jr);
             break;
         }

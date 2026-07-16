@@ -5,7 +5,6 @@
 #include <json-c/json.h>
 
 char* nostream(json_object *root, CURL *curl);
-char* readenv(const char *path);
 void fuck(const char *reason);
 
 #endif
