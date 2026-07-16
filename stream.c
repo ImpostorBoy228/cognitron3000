@@ -3,6 +3,7 @@
 #include <string.h>
 #include <curl/curl.h>
 #include <json-c/json.h>
+#include "libs/mimalloc.h"
 
 struct Memory {
     char *response;
@@ -22,7 +23,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
     size_t needed = s->len + total + 1;
     if (needed > s->cap) {
         size_t newcap = needed + 1024;
-        char *ptr = realloc(s->buffer, newcap);
+        char *ptr = mi_realloc(s->buffer, newcap);
         if (!ptr) return 0;
         s->buffer = ptr;
         s->cap = newcap;
@@ -77,7 +78,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
 static size_t write_memory(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t total = size * nmemb;
     struct Memory *mem = (struct Memory *)userp;
-    char *ptr = realloc(mem->response, mem->size + total + 1);
+    char *ptr = mi_realloc(mem->response, mem->size + total + 1);
     if (!ptr) return 0;
     mem->response = ptr;
     memcpy(&(mem->response[mem->size]), contents, total);
@@ -93,10 +94,10 @@ char* readenv(void) {
     long len = ftell(f);
     if (len <= 0) { fclose(f); return NULL; }
     fseek(f, 0, SEEK_SET);
-    char *buf = malloc(len + 1);
+    char *buf = mi_malloc(len + 1);
     if (!buf) { fclose(f); return NULL; }
     size_t n = fread(buf, 1, len, f);
-    if (n != (size_t)len) { free(buf); fclose(f); return NULL; }
+    if (n != (size_t)len) { mi_free(buf); fclose(f); return NULL; }
     while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
     buf[n] = '\0';
     fclose(f);
@@ -120,12 +121,12 @@ char* nostream(json_object *root, CURL *curl) {
     CURLcode res = curl_easy_perform(curl);
 
     if (res != CURLE_OK) {
-        free(chunk.response);
+        mi_free(chunk.response);
         return NULL;
     }
 
     json_object *resp_json = json_tokener_parse(chunk.response);
-    free(chunk.response);
+    mi_free(chunk.response);
     if (!resp_json) return NULL;
 
     json_object *choices;
@@ -137,7 +138,7 @@ char* nostream(json_object *root, CURL *curl) {
             if (json_object_object_get_ex(first, "message", &message)) {
                 json_object *content;
                 if (json_object_object_get_ex(message, "content", &content)) {
-                    result = strdup(json_object_get_string(content));
+                    result = mi_strdup(json_object_get_string(content));
                 }
             }
         }
@@ -170,7 +171,7 @@ int main() {
     json_object_object_add(reasoning, "enabled", json_object_new_boolean(0));
     json_object_object_add(root, "reasoning", reasoning);
 
-    json_data = strdup(json_object_to_json_string(root));
+    json_data = mi_strdup(json_object_to_json_string(root));
     if (!json_data) {
         fuck("to create JSON");
         ret = 1;
@@ -213,13 +214,13 @@ int main() {
     printf("\n");
 
     curl_easy_cleanup(curl);
-    free(chunk.buffer);
+    mi_free(chunk.buffer);
 
     curl_global_cleanup();
 
 naxyi:
-    free(token);
-    free(json_data);
+    mi_free(token);
+    mi_free(json_data);
     json_object_put(root);
     curl_slist_free_all(headers);
     return ret;

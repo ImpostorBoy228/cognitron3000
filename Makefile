@@ -1,5 +1,5 @@
 CFLAGS = $(shell pkg-config --cflags json-c telebot)
-LIBS = $(shell pkg-config --libs json-c telebot) -lcurl
+LIBS = $(shell pkg-config --libs json-c telebot) -lcurl -Llibs -lmimalloc -lpthread -lsqlite3
 
 all: main agent
 
