@@ -130,9 +130,8 @@ static json_object* toolcall(json_object *msgs, CURL *curl) {
     headers = curl_slist_append(headers, auth);
     mi_free(apikey);
 
-    const char *jstr = json_object_to_json_string(root);
-
     struct memchunk c = {NULL, 0};
+    const char *jstr = json_object_to_json_string(root);
     curl_easy_setopt(curl, CURLOPT_URL, "https://api.cerebras.ai/v1/chat/completions");
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jstr);
@@ -144,6 +143,8 @@ static json_object* toolcall(json_object *msgs, CURL *curl) {
     curl_slist_free_all(headers);
 
     if (res != CURLE_OK) { mi_free(c.buf); return NULL; }
+
+    wlog(c.buf);
 
     json_object *jr = json_tokener_parse(c.buf);
     mi_free(c.buf);
@@ -160,6 +161,7 @@ static char* exec_cmd(const char *cmd) {
     if (pid == 0) {
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
         execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
         _exit(127);
@@ -183,7 +185,7 @@ static char* exec_cmd(const char *cmd) {
     close(pipefd[0]);
     waitpid(pid, NULL, 0);
     buf[len] = '\0';
-    char logbuf[len];
+    char logbuf[2048];
     snprintf(logbuf, sizeof(logbuf), "[TOOL: command](%s)\n%s", cmd, buf);
     wlog(logbuf);
     return buf;
@@ -196,9 +198,11 @@ static char* exec_tool(const char *name, const char *args_json, telebot_handler_
     if (strcmp(name, "os_command") == 0) {
         json_object *cmd;
         if (!json_object_object_get_ex(args, "command", &cmd)) { json_object_put(args); return mi_strdup("{\"error\": \"missing command\"}"); }
-        const char *command = json_object_get_string(cmd);
+        char *command = mi_strdup(json_object_get_string(cmd));
         json_object_put(args);
-        return exec_cmd(command);
+        char *result = exec_cmd(command);
+        mi_free(command);
+        return result;
 
     } else if (strcmp(name, "file_read") == 0) {
         json_object *path;
@@ -217,12 +221,13 @@ static char* exec_tool(const char *name, const char *args_json, telebot_handler_
     } else if (strcmp(name, "send_telegram") == 0) {
         json_object *msg;
         if (!json_object_object_get_ex(args, "message", &msg)) { json_object_put(args); return mi_strdup("{\"error\": \"missing message\"}"); }
-        const char *text = json_object_get_string(msg);
+        char *text = mi_strdup(json_object_get_string(msg));
         json_object_put(args);
         telebot_send_message(bot, chat_id, text, NULL, false, false, 0, NULL);
         char logbuf[1024];
         snprintf(logbuf, sizeof(logbuf), "[SEND_TG] %s", text);
         wlog(logbuf);
+        mi_free(text);
         return mi_strdup("{\"status\": \"sent\"}");
 
     } else {
@@ -239,11 +244,25 @@ static char* llmreq(json_object *msgs, CURL *curl, telebot_handler_t bot, int64_
 
     for (int turn = 0; turn < max_turns; turn++) {
         json_object *jr = toolcall(msgs, curl);
-        if (!jr) break;
+        if (!jr) {
+            result = mi_strdup("API request failed (network error)");
+            break;
+        }
+
+        json_object *api_error;
+        if (json_object_object_get_ex(jr, "error", &api_error)) {
+            json_object *err_msg;
+            const char *err_text = json_object_object_get_ex(api_error, "message", &err_msg)
+                ? json_object_get_string(err_msg) : "unknown API error";
+            result = mi_strdup(err_text);
+            json_object_put(jr);
+            break;
+        }
 
         json_object *choices;
         if (!json_object_object_get_ex(jr, "choices", &choices) || !json_object_is_type(choices, json_type_array) || json_object_array_length(choices) == 0) {
             json_object_put(jr);
+            result = mi_strdup("API returned no choices");
             break;
         }
 
@@ -302,6 +321,14 @@ static char* llmreq(json_object *msgs, CURL *curl, telebot_handler_t bot, int64_
             json_object *tool_msg = json_object_new_object();
             json_object_object_add(tool_msg, "role", json_object_new_string("tool"));
             json_object_object_add(tool_msg, "tool_call_id", json_object_new_string(tc_id));
+            size_t flen = strlen(fresult);
+            if (flen > 4096*4) {
+                fresult[4096*4] = '\0';
+                char *trimmed = mi_malloc(4096*4+20);
+                snprintf(trimmed, 520, "%s\n... (truncated)", fresult);
+                mi_free(fresult);
+                fresult = trimmed;
+            }
             json_object_object_add(tool_msg, "content", json_object_new_string(fresult));
             json_object_array_add(msgs, tool_msg);
             mi_free(fresult);
@@ -397,8 +424,20 @@ int main(void) {
             char *reply = llmreq(msgs, curl, bot, u->message.chat->id);
             if (reply) {
                 if (strcmp(reply, "[STOP_LOOP]") != 0) {
-                    snprintf(logbuf, sizeof(logbuf), "[RAW] %s", reply);
+                    snprintf(logbuf, sizeof(logbuf), "[ERROR] %s", reply);
                     wlog(logbuf);
+                    telebot_send_message(bot, u->message.chat->id, reply, NULL, false, false, 0, NULL);
+                    json_object_put(msgs);
+                    msgs = json_object_new_array();
+                    char *sys = rfile("prompts/system_main.md");
+                    if (sys) {
+                        json_object *sysmsg = json_object_new_object();
+                        json_object_object_add(sysmsg, "role", json_object_new_string("system"));
+                        json_object_object_add(sysmsg, "content", json_object_new_string(sys));
+                        json_object_array_add(msgs, sysmsg);
+                        mi_free(sys);
+                    }
+                    wlog("[RESET] context cleared after API error");
                 }
                 mi_free(reply);
             }
