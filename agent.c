@@ -11,68 +11,6 @@
 #include "nostream.h"
 #include "libs/mimalloc.h"
 
-typedef struct msg {
-    char *role;
-    char *content;
-    struct msg *prev;
-    struct msg *next;
-} msg;
-
-typedef struct {
-    msg *head;
-    msg *tail;
-    int count;
-} messages;
-
-static msg* msgnew(const char *role, const char *content) {
-    msg *node = mi_calloc(1, sizeof(msg));
-    if (!node) return NULL;
-    node->role = mi_strdup(role);
-    node->content = mi_strdup(content);
-    if (!node->role || !node->content) {
-        mi_free(node->role);
-        mi_free(node->content);
-        mi_free(node);
-        return NULL;
-    }
-    return node;
-}
-
-static void msgappend(messages *list, msg *node) {
-    if (!list->head) {
-        list->head = list->tail = node;
-    } else {
-        list->tail->next = node;
-        node->prev = list->tail;
-        list->tail = node;
-    }
-    list->count++;
-}
-
-static json_object* msgs2json(msg *head) {
-    json_object *arr = json_object_new_array();
-    for (msg *cur = head; cur; cur = cur->next) {
-        json_object *m = json_object_new_object();
-        json_object_object_add(m, "role", json_object_new_string(cur->role));
-        json_object_object_add(m, "content", json_object_new_string(cur->content));
-        json_object_array_add(arr, m);
-    }
-    return arr;
-}
-
-static void msgsmi_free(messages *list) {
-    msg *cur = list->head;
-    while (cur) {
-        msg *next = cur->next;
-        mi_free(cur->role);
-        mi_free(cur->content);
-        mi_free(cur);
-        cur = next;
-    }
-    list->head = list->tail = NULL;
-    list->count = 0;
-}
-
 static char* readenv(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -297,22 +235,7 @@ static char* exec_tool(const char *name, const char *args_json) {
     }
 }
 
-static char* llmreq(const char *user_text, CURL *curl) {
-    char *sys = rfile("prompts/system_main.md");
-    if (!sys) return NULL;
-
-    json_object *msgs = json_object_new_array();
-    json_object *sysmsg = json_object_new_object();
-    json_object_object_add(sysmsg, "role", json_object_new_string("system"));
-    json_object_object_add(sysmsg, "content", json_object_new_string(sys));
-    json_object_array_add(msgs, sysmsg);
-    mi_free(sys);
-
-    json_object *usermsg = json_object_new_object();
-    json_object_object_add(usermsg, "role", json_object_new_string("user"));
-    json_object_object_add(usermsg, "content", json_object_new_string(user_text));
-    json_object_array_add(msgs, usermsg);
-
+static char* llmreq(json_object *msgs, CURL *curl) {
     char *result = NULL;
     int max_turns = 10;
 
@@ -387,7 +310,6 @@ static char* llmreq(const char *user_text, CURL *curl) {
         json_object_put(jr);
     }
 
-    json_object_put(msgs);
     return result;
 }
 
@@ -428,6 +350,16 @@ int main(void) {
         telebot_put_me(&me);
     }
 
+    json_object *msgs = json_object_new_array();
+    char *sys = rfile("prompts/system_main.md");
+    if (sys) {
+        json_object *sysmsg = json_object_new_object();
+        json_object_object_add(sysmsg, "role", json_object_new_string("system"));
+        json_object_object_add(sysmsg, "content", json_object_new_string(sys));
+        json_object_array_add(msgs, sysmsg);
+        mi_free(sys);
+    }
+
     int offset = 0;
     telebot_update_type_e types[] = {TELEBOT_UPDATE_TYPE_MESSAGE};
 
@@ -454,7 +386,12 @@ int main(void) {
 
             telebot_send_chat_action(bot, u->message.chat->id, "typing");
 
-            char *reply = llmreq(u->message.text, curl);
+            json_object *usermsg = json_object_new_object();
+            json_object_object_add(usermsg, "role", json_object_new_string("user"));
+            json_object_object_add(usermsg, "content", json_object_new_string(u->message.text));
+            json_object_array_add(msgs, usermsg);
+
+            char *reply = llmreq(msgs, curl);
             if (reply) {
                 telebot_error_e err = telebot_send_message(bot, u->message.chat->id, reply, "HTML", false, false, 0, NULL);
                 if (err != TELEBOT_ERROR_NONE)
@@ -471,6 +408,7 @@ int main(void) {
         telebot_put_updates(updates, count);
     }
 
+    json_object_put(msgs);
     telebot_destroy(bot);
     curl_easy_cleanup(curl);
     curl_global_cleanup();
