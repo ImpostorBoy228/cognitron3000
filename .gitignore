@@ -1,1 +1,6 @@
 .env
+.env-bak
+.token
+agent
+stream
+build/

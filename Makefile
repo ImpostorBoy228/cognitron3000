@@ -1,9 +1,15 @@
+CFLAGS = $(shell pkg-config --cflags json-c telebot)
+LIBS = $(shell pkg-config --libs json-c telebot) -lcurl
+
 all: main agent
 
-main: main.c libs/cjson/cJSON.c
-	gcc main.c libs/cjson/cJSON.c -o main -I libs/cjson -lcurl
+main: stream.c
+	gcc stream.c -o stream $(CFLAGS) $(LIBS)
 
-agent: agent.c nostream.c libs/cjson/cJSON.c
-	gcc agent.c nostream.c libs/cjson/cJSON.c -o agent -I libs/cjson -lcurl
+agent: agent.c nostream.c
+	gcc agent.c nostream.c -o agent $(CFLAGS) $(LIBS)
+
+clean: 
+	rm -f *.o stream agent nostream
 
 .PHONY: all main agent

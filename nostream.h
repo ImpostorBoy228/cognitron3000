@@ -2,9 +2,10 @@
 #define NOSTREAM_H
 
 #include <curl/curl.h>
-#include "cJSON.h"
+#include <json-c/json.h>
 
-char* nostream(cJSON *root, CURL *curl);
-char* readenv(void);
+char* nostream(json_object *root, CURL *curl);
+char* readenv(const char *path);
+void fuck(const char *reason);
 
 #endif

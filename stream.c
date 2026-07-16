@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <curl/curl.h>
-#include "cJSON.h"
+#include <json-c/json.h>
 
 struct Memory {
     char *response;
@@ -43,19 +43,23 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb, void *us
             if (strncmp(line, "data: ", 6) == 0) {
                 char *data = line + 6;
                 if (strcmp(data, "[DONE]") != 0) {
-                    cJSON *json = cJSON_Parse(data);
+                    json_object *json = json_tokener_parse(data);
                     if (json) {
-                        cJSON *choices = cJSON_GetObjectItem(json, "choices");
-                        if (cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-                            cJSON *first = cJSON_GetArrayItem(choices, 0);
-                            cJSON *delta = cJSON_GetObjectItem(first, "delta");
-                            cJSON *content = cJSON_GetObjectItem(delta, "content");
-                            if (cJSON_IsString(content)) {
-                                printf("%s", content->valuestring);
-                                fflush(stdout);
+                        json_object *choices;
+                        if (json_object_object_get_ex(json, "choices", &choices)) {
+                            if (json_object_is_type(choices, json_type_array) && json_object_array_length(choices) > 0) {
+                                json_object *first = json_object_array_get_idx(choices, 0);
+                                json_object *delta;
+                                if (json_object_object_get_ex(first, "delta", &delta)) {
+                                    json_object *content;
+                                    if (json_object_object_get_ex(delta, "content", &content)) {
+                                        printf("%s", json_object_get_string(content));
+                                        fflush(stdout);
+                                    }
+                                }
                             }
                         }
-                        cJSON_Delete(json);
+                        json_object_put(json);
                     }
                 }
             }
@@ -99,47 +103,46 @@ char* readenv(void) {
     return buf;
 }
 
-void fuck(char* reason, FILE* stream) {
-    fprintf(stream, "fuck: %s\n", reason);
+void fuck(const char *reason) {
+    fprintf(stderr, "fuck: %s\n", reason);
 }
 
-char* nostream(cJSON *root, CURL *curl) {
+char* nostream(json_object *root, CURL *curl) {
     struct Memory chunk = {NULL, 0};
-    char *json_data = cJSON_Print(root);
-    if (!json_data) return NULL;
+    const char *json_str = json_object_to_json_string(root);
+    if (!json_str) return NULL;
 
-    curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, json_data);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_data));
+    curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, json_str);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)strlen(json_str));
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_memory);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
 
     CURLcode res = curl_easy_perform(curl);
-    free(json_data);
 
     if (res != CURLE_OK) {
         free(chunk.response);
         return NULL;
     }
 
-    cJSON *resp_json = cJSON_Parse(chunk.response);
+    json_object *resp_json = json_tokener_parse(chunk.response);
     free(chunk.response);
     if (!resp_json) return NULL;
 
-    cJSON *choices = cJSON_GetObjectItem(resp_json, "choices");
+    json_object *choices;
     char *result = NULL;
-    if (cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-        cJSON *first = cJSON_GetArrayItem(choices, 0);
-        if (first) {
-            cJSON *message = cJSON_GetObjectItem(first, "message");
-            if (message) {
-                cJSON *content = cJSON_GetObjectItem(message, "content");
-                if (cJSON_IsString(content)) {
-                    result = strdup(content->valuestring);
+    if (json_object_object_get_ex(resp_json, "choices", &choices)) {
+        if (json_object_is_type(choices, json_type_array) && json_object_array_length(choices) > 0) {
+            json_object *first = json_object_array_get_idx(choices, 0);
+            json_object *message;
+            if (json_object_object_get_ex(first, "message", &message)) {
+                json_object *content;
+                if (json_object_object_get_ex(message, "content", &content)) {
+                    result = strdup(json_object_get_string(content));
                 }
             }
         }
     }
-    cJSON_Delete(resp_json);
+    json_object_put(resp_json);
     return result;
 }
 
@@ -148,28 +151,28 @@ int main() {
     CURL *curl = NULL;
     CURLcode res;
     struct StreamState chunk = {NULL, 0, 0};
-    cJSON *root = NULL;
+    json_object *root = NULL;
     char *json_data = NULL, *token = NULL;
     struct curl_slist *headers = NULL;
 
-    root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "model", "nvidia/nemotron-3-super-120b-a12b:free");
-    cJSON_AddBoolToObject(root, "stream", 1);
+    root = json_object_new_object();
+    json_object_object_add(root, "model", json_object_new_string("nvidia/nemotron-3-super-120b-a12b:free"));
+    json_object_object_add(root, "stream", json_object_new_boolean(1));
 
-    cJSON *messages = cJSON_CreateArray();
-    cJSON *msg = cJSON_CreateObject();
-    cJSON_AddStringToObject(msg, "role", "user");
-    cJSON_AddStringToObject(msg, "content", "hello. this is test for my c program. расскажи о коллбеках в c как будто ты демонический разраб с гитхаба. сделай это за 15 слов");
-    cJSON_AddItemToArray(messages, msg);
-    cJSON_AddItemToObject(root, "messages", messages);
+    json_object *messages = json_object_new_array();
+    json_object *msg = json_object_new_object();
+    json_object_object_add(msg, "role", json_object_new_string("user"));
+    json_object_object_add(msg, "content", json_object_new_string("hello. this is test for my c program. расскажи о коллбеках в c как будто ты демонический разраб с гитхаба. сделай это за 15 слов"));
+    json_object_array_add(messages, msg);
+    json_object_object_add(root, "messages", messages);
 
-    cJSON *reasoning = cJSON_CreateObject();
-    cJSON_AddBoolToObject(reasoning, "enabled", 0);
-    cJSON_AddItemToObject(root, "reasoning", reasoning);
+    json_object *reasoning = json_object_new_object();
+    json_object_object_add(reasoning, "enabled", json_object_new_boolean(0));
+    json_object_object_add(root, "reasoning", reasoning);
 
-    json_data = cJSON_Print(root);
+    json_data = strdup(json_object_to_json_string(root));
     if (!json_data) {
-        fprintf(stderr, "fuck: to create JSON\n");
+        fuck("to create JSON");
         ret = 1;
         goto naxyi;
     }
@@ -178,7 +181,7 @@ int main() {
     headers = curl_slist_append(headers, "Accept: text/event-stream");
     token = readenv();
     if (!token) {
-        fuck("no .env file", stderr);
+        fuck("no .env file");
         ret = 1;
         goto naxyi;
     }
@@ -189,7 +192,7 @@ int main() {
     curl = curl_easy_init();
 
     if (!curl) {
-        fprintf(stderr, "fuck: failed to init curl\n");
+        fuck("failed to init curl");
         ret = 1;
         goto naxyi;
     }
@@ -204,7 +207,7 @@ int main() {
     res = curl_easy_perform(curl);
 
     if (res != CURLE_OK) {
-        fprintf(stderr, "curl failed: %s\n", curl_easy_strerror(res));
+        fuck("curl failed");
         ret = 1;
     }
     printf("\n");
@@ -217,7 +220,7 @@ int main() {
 naxyi:
     free(token);
     free(json_data);
-    cJSON_Delete(root);
+    json_object_put(root);
     curl_slist_free_all(headers);
     return ret;
 }
